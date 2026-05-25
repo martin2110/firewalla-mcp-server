@@ -106,6 +106,7 @@ export type StreamingOperation<T = any> = (
   hasMore: boolean;
   nextCursor?: string | null;
   total?: number;
+  metadata?: Record<string, unknown>;
 }>;
 
 /**
@@ -229,6 +230,7 @@ export class StreamingManager {
           estimatedRemainingItems: this.estimateRemainingItems(result, session),
           processingTimeMs: processingTime,
           memoryUsage: this.getMemoryUsage(),
+          ...result.metadata,
         },
         timestamp: now.toISOString(),
       };

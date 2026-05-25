@@ -1365,9 +1365,11 @@ export class QuerySanitizer {
 
     // FieldValidator is now imported at the top of the file
     
-    // Extract field names from query using simple regex
-    // Matches patterns like "field_name:" or "field_name:value"
-    const fieldPattern = /(\w+):/g;
+    // Extract field names from query. Field names can include dots for raw
+    // Firewalla API fields (e.g. "box.id" and "source.ip"). Require a field
+    // boundary (start, whitespace, or opening parenthesis) so value colons such
+    // as URL schemes or MAC address segments are not treated as field names.
+    const fieldPattern = /(?:^|[\s(])([a-zA-Z_][a-zA-Z0-9_.]*):/g;
     const foundFields: string[] = [];
     let match;
     

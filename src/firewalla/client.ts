@@ -69,6 +69,128 @@ interface APIResponse<T> {
   error?: string;
 }
 
+const FLOW_FIELD_ALIASES: Record<string, string> = {
+  source_ip: 'source.ip',
+  destination_ip: 'destination.ip',
+  device_ip: 'device.ip',
+  blocked: 'block',
+};
+
+const FLOW_QUERY_FIELDS = new Set([
+  'box.id',
+  'source.ip',
+  'destination.ip',
+  'device.ip',
+  'gid',
+  'ts',
+  'domain',
+  'category',
+  'block',
+  'total',
+  'bytes',
+  'download',
+  'upload',
+  ...Object.keys(FLOW_FIELD_ALIASES),
+]);
+
+function maskQuotedQueryValues(query: string): {
+  maskedQuery: string;
+  quotedValues: string[];
+} {
+  const quotedValues: string[] = [];
+  let maskedQuery = '';
+
+  for (let index = 0; index < query.length; index++) {
+    const char = query[index];
+
+    if (char !== '"' && char !== "'") {
+      maskedQuery += char;
+      continue;
+    }
+
+    const quote = char;
+    let quotedValue = quote;
+    index++;
+
+    while (index < query.length) {
+      const quotedChar = query[index];
+      quotedValue += quotedChar;
+
+      if (quotedChar === '\\' && index + 1 < query.length) {
+        index++;
+        quotedValue += query[index];
+        continue;
+      }
+
+      if (quotedChar === quote) {
+        break;
+      }
+
+      index++;
+    }
+
+    const placeholder = `__FIREWALLA_QUOTED_VALUE_${quotedValues.length}__`;
+    quotedValues.push(quotedValue);
+    maskedQuery += placeholder;
+  }
+
+  return { maskedQuery, quotedValues };
+}
+
+function unmaskQuotedQueryValues(
+  query: string,
+  quotedValues: string[]
+): string {
+  return query.replace(
+    /__FIREWALLA_QUOTED_VALUE_(\d+)__/g,
+    (placeholder: string, index: string) => quotedValues[Number(index)] ?? placeholder
+  );
+}
+
+function normalizeFlowQuery(query?: string): string | undefined {
+  if (!query || typeof query !== 'string') {
+    return query;
+  }
+
+  const trimmedQuery = query.trim();
+  if (!trimmedQuery) {
+    return trimmedQuery;
+  }
+
+  const { maskedQuery, quotedValues } = maskQuotedQueryValues(trimmedQuery);
+  let normalized = maskedQuery;
+
+  for (const [alias, rawField] of Object.entries(FLOW_FIELD_ALIASES)) {
+    normalized = normalized.replace(
+      new RegExp(`(^|[\\s(])${alias}(?=:)`, 'g'),
+      `$1${rawField}`
+    );
+  }
+
+  // Firewalla accepts adjacent field:value expressions as an implicit AND in
+  // observed flow queries. Normalize before sending to keep API calls explicit.
+  normalized = normalized.replace(
+    /(\S+)\s+(?=([a-zA-Z_][a-zA-Z0-9_.]*):)/g,
+    (match: string, previousToken: string, fieldName: string) => {
+      if (['AND', 'OR', 'NOT'].includes(previousToken.toUpperCase())) {
+        return match;
+      }
+
+      if (previousToken.endsWith('(')) {
+        return match;
+      }
+
+      if (FLOW_QUERY_FIELDS.has(fieldName)) {
+        return `${previousToken} AND `;
+      }
+
+      return match;
+    }
+  );
+
+  return unmaskQuotedQueryValues(normalized, quotedValues);
+}
+
 /**
  * Firewalla API Client for MSP Integration
  *
@@ -649,7 +771,7 @@ export class FirewallaClient {
 
     // Simplified: only add query if provided
     if (query?.trim()) {
-      params.query = query.trim();
+      params.query = normalizeFlowQuery(query);
     }
     if (groupBy) {
       params.groupBy = groupBy;
@@ -2740,7 +2862,7 @@ export class FirewallaClient {
 
     // Add query if provided
     if (searchQuery.query?.trim()) {
-      params.query = searchQuery.query.trim();
+      params.query = normalizeFlowQuery(searchQuery.query);
     }
 
     if (searchQuery.group_by) {

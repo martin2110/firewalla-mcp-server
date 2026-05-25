@@ -39,6 +39,7 @@ export class GetFlowDataHandler extends BaseToolHandler {
   description =
     'Query network traffic flows with pagination. Data is cached for 15 seconds for performance. Use force_refresh=true to bypass cache for real-time data.';
   category = 'network' as const;
+  private readonly streamingManager = StreamingManager.forTool(this.name);
 
   constructor() {
     super({
@@ -208,7 +209,7 @@ export class GetFlowDataHandler extends BaseToolHandler {
 
       // Handle streaming mode if enabled
       if (enableStreaming) {
-        const streamingManager = StreamingManager.forTool(this.name);
+        const { streamingManager } = this;
 
         // Define the streaming operation
         const streamingOperation: StreamingOperation = async params => {
@@ -263,11 +264,13 @@ export class GetFlowDataHandler extends BaseToolHandler {
           );
 
           const actualFinalQuery = response.final_query || finalQuery;
+          const hasMore = response.has_more ?? !!response.next_cursor;
+          const nextCursor = hasMore ? response.next_cursor : null;
 
           return {
             data: processedFlows,
-            hasMore: !!response.next_cursor,
-            nextCursor: response.next_cursor,
+            hasMore,
+            nextCursor,
             total: (response as any).total_count,
             metadata: {
               query_parameters: {
@@ -277,6 +280,13 @@ export class GetFlowDataHandler extends BaseToolHandler {
                 start_time: startTimeArg,
                 end_time: endTime,
               },
+              pages_fetched: response.pages_fetched ?? 1,
+              has_more: hasMore,
+              next_cursor: nextCursor,
+              stopped_reason: response.stopped_reason ?? null,
+              repeated_cursor: response.repeated_cursor,
+              requested_limit: response.requested_limit,
+              applied_limit: response.applied_limit,
             },
           };
         };
@@ -362,11 +372,13 @@ export class GetFlowDataHandler extends BaseToolHandler {
       ]);
 
       const actualFinalQuery = response.final_query || finalQuery;
+      const hasMore = response.has_more ?? !!response.next_cursor;
+      const nextCursor = hasMore ? response.next_cursor : null;
 
       // Create metadata for standardized response
       const metadata: PaginationMetadata = {
-        cursor: response.next_cursor,
-        hasMore: !!response.next_cursor,
+        cursor: nextCursor || undefined,
+        hasMore,
         limit,
         executionTime,
         cached: false,
@@ -384,10 +396,17 @@ export class GetFlowDataHandler extends BaseToolHandler {
       };
 
       // Create standardized response
-      const standardResponse = ResponseStandardizer.toPaginatedResponse(
+      const standardResponse: any = ResponseStandardizer.toPaginatedResponse(
         processedFlows,
         metadata
       );
+      standardResponse.pagination.next_cursor = nextCursor;
+      standardResponse.pagination.has_more = hasMore;
+      standardResponse.pagination.pages_fetched = response.pages_fetched ?? 1;
+      standardResponse.pagination.stopped_reason = response.stopped_reason ?? null;
+      standardResponse.pagination.repeated_cursor = response.repeated_cursor;
+      standardResponse.pagination.requested_limit = response.requested_limit;
+      standardResponse.pagination.applied_limit = response.applied_limit;
 
       return this.createUnifiedResponse(standardResponse, {
         executionTimeMs: executionTime,

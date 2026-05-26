@@ -116,6 +116,10 @@ function tokenizeQuery(query: string): QueryToken[] {
         position: wordStart,
       });
     } else if (
+      // If the next character is an operator, this token is a field even when
+      // it follows a complete field:value expression. This permits Firewalla's
+      // observed implicit AND syntax: "box.id:x source.ip:y".
+      /[:<>=!]/.test(query[current] || '') ||
       tokens.length === 0 ||
       tokens[tokens.length - 1].type === 'logical' ||
       tokens[tokens.length - 1].value === '('

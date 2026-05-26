@@ -14,9 +14,41 @@
 import { FieldValidator } from '../../src/validation/field-validator.js';
 import { QuerySanitizer, ParameterValidator } from '../../src/validation/error-handler.js';
 import { SEARCH_FIELDS } from '../../src/search/types.js';
+import { validateFirewallaQuerySyntax } from '../../src/utils/query-validator.js';
 
 describe('Query Syntax Validation', () => {
   describe('Basic Field Queries', () => {
+    it('should validate Firewalla raw dotted flow fields with implicit AND', () => {
+      const syntaxResult = validateFirewallaQuerySyntax('box.id:box-123 source.ip:192.168.1.10');
+      expect(syntaxResult.isValid).toBe(true);
+      expect(syntaxResult.errors).toHaveLength(0);
+
+      const fieldResult = QuerySanitizer.validateQueryFields(
+        'box.id:box-123 source.ip:192.168.1.10',
+        'flows'
+      );
+      expect(fieldResult.isValid).toBe(true);
+      expect(fieldResult.errors).toHaveLength(0);
+    });
+
+    it('should validate Firewalla raw dotted flow fields with explicit AND and alias equivalents', () => {
+      const validQueries = [
+        'box.id:box-123 AND source.ip:192.168.1.10',
+        'destination.ip:8.8.8.8 AND device.ip:192.168.1.10',
+        'source_ip:192.168.1.10 AND destination_ip:8.8.8.8 AND device_ip:192.168.1.10',
+      ];
+
+      validQueries.forEach(query => {
+        const syntaxResult = validateFirewallaQuerySyntax(query);
+        expect(syntaxResult.isValid).toBe(true);
+        expect(syntaxResult.errors).toHaveLength(0);
+
+        const fieldResult = QuerySanitizer.validateQueryFields(query, 'flows');
+        expect(fieldResult.isValid).toBe(true);
+        expect(fieldResult.errors).toHaveLength(0);
+      });
+    });
+
     it('should validate simple field:value queries', () => {
       const validQueries = [
         'protocol:tcp',

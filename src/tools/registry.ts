@@ -39,6 +39,7 @@ import {
 } from './handlers/security.js';
 import {
   GetFlowDataHandler,
+  ExportFlowDataHandler,
   GetBandwidthUsageHandler,
   GetOfflineDevicesHandler,
 } from './handlers/network.js';
@@ -136,8 +137,9 @@ export class ToolRegistry {
     // returns false success responses but doesn't actually delete alarms
     // this.register(new DeleteAlarmHandler());
 
-    // Network tools (1 handler - get_flow_data)
+    // Network tools (2 handlers - flow query/export)
     this.register(new GetFlowDataHandler());
+    this.register(new ExportFlowDataHandler());
 
     // Device tools (1 handler)
     this.register(new GetDeviceStatusHandler());

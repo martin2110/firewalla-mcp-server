@@ -166,6 +166,179 @@ describe('FirewallaClient getFlowData flow query construction', () => {
 });
 
 describe('GetFlowDataHandler final query metadata', () => {
+  it('reports observed time-range and retention metadata in non-streaming flow responses', async () => {
+    const finalQuery = `box.id:${BOX_ID} source.ip:192.168.1.50`;
+    const handler = new GetFlowDataHandler();
+    const firewalla = {
+      getFlowData: jest.fn().mockResolvedValue({
+        count: 3,
+        results: [
+          {
+            ts: 1710000300,
+            protocol: 'tcp',
+            download: 1,
+            upload: 1,
+            count: 1,
+            device: { id: 'device-1', ip: '192.168.1.50', name: 'Laptop' },
+          },
+          {
+            ts: 1709999700,
+            protocol: 'udp',
+            download: 2,
+            upload: 2,
+            count: 1,
+            device: { id: 'device-1', ip: '192.168.1.50', name: 'Laptop' },
+          },
+          {
+            ts: 1710000000,
+            protocol: 'tcp',
+            download: 3,
+            upload: 3,
+            count: 1,
+            device: { id: 'device-1', ip: '192.168.1.50', name: 'Laptop' },
+          },
+        ],
+        final_query: finalQuery,
+        next_cursor: undefined,
+        has_more: false,
+        pages_fetched: 1,
+        stopped_reason: 'no_more_results',
+      }),
+    } as any;
+
+    const response = await handler.execute(
+      { query: 'source.ip:192.168.1.50', limit: 50 },
+      firewalla
+    );
+    const payload = JSON.parse(response.content[0].text);
+
+    expect(payload.data.pagination).toEqual(
+      expect.objectContaining({
+        observed_time_range: {
+          oldest: '2024-03-09T15:55:00.000Z',
+          newest: '2024-03-09T16:05:00.000Z',
+          start: '2024-03-09T15:55:00.000Z',
+          end: '2024-03-09T16:05:00.000Z',
+        },
+        total_records_fetched: 3,
+        pages_fetched: 1,
+        has_more: false,
+        stopped_reason: 'no_more_results',
+        query: finalQuery,
+      })
+    );
+  });
+
+  it('marks non-streaming flow responses with no cursor as no_more_results even when the client omits a stopped reason', async () => {
+    const handler = new GetFlowDataHandler();
+    const firewalla = {
+      getFlowData: jest.fn().mockResolvedValue({
+        count: 1,
+        results: [
+          {
+            ts: 1710000000,
+            protocol: 'tcp',
+            download: 1,
+            upload: 1,
+            count: 1,
+          },
+        ],
+        final_query: `box.id:${BOX_ID}`,
+        has_more: false,
+      }),
+    } as any;
+
+    const response = await handler.execute({ limit: 50 }, firewalla);
+    const payload = JSON.parse(response.content[0].text);
+
+    expect(payload.data.pagination.has_more).toBe(false);
+    expect(payload.data.pagination.stopped_reason).toBe('no_more_results');
+  });
+
+  it('marks non-streaming flow responses with remaining pages as page_limit', async () => {
+    const handler = new GetFlowDataHandler();
+    const firewalla = {
+      getFlowData: jest.fn().mockResolvedValue({
+        count: 1,
+        results: [
+          {
+            ts: 1710000000,
+            protocol: 'tcp',
+            download: 1,
+            upload: 1,
+            count: 1,
+          },
+        ],
+        final_query: `box.id:${BOX_ID}`,
+        next_cursor: 'next-page',
+        has_more: true,
+      }),
+    } as any;
+
+    const response = await handler.execute({ limit: 50 }, firewalla);
+    const payload = JSON.parse(response.content[0].text);
+
+    expect(payload.data.pagination.has_more).toBe(true);
+    expect(payload.data.pagination.next_cursor).toBe('next-page');
+    expect(payload.data.pagination.stopped_reason).toBe('page_limit');
+  });
+
+  it('reports observed time-range and fetched record metadata in the default streaming flow response', async () => {
+    const finalQuery = `box.id:${BOX_ID} source.ip:192.168.1.50`;
+    const handler = new GetFlowDataHandler();
+    const firewalla = {
+      getFlowData: jest.fn().mockResolvedValue({
+        count: 2,
+        results: [
+          {
+            ts: 1710000300,
+            protocol: 'tcp',
+            download: 1,
+            upload: 1,
+            count: 1,
+            device: { id: 'device-1', ip: '192.168.1.50', name: 'Laptop' },
+          },
+          {
+            ts: 1709999700,
+            protocol: 'udp',
+            download: 2,
+            upload: 2,
+            count: 1,
+            device: { id: 'device-1', ip: '192.168.1.50', name: 'Laptop' },
+          },
+        ],
+        final_query: finalQuery,
+        next_cursor: undefined,
+        has_more: false,
+        pages_fetched: 1,
+        stopped_reason: 'no_more_results',
+      }),
+    } as any;
+
+    const response = await handler.execute(
+      { query: 'source.ip:192.168.1.50' },
+      firewalla
+    );
+    const payload = JSON.parse(response.content[0].text);
+
+    expect(payload.streaming).toBe(true);
+    expect(payload.metadata).toEqual(
+      expect.objectContaining({
+        observed_time_range: {
+          oldest: '2024-03-09T15:55:00.000Z',
+          newest: '2024-03-09T16:05:00.000Z',
+          start: '2024-03-09T15:55:00.000Z',
+          end: '2024-03-09T16:05:00.000Z',
+        },
+        total_records_fetched: 2,
+        pages_fetched: 1,
+        has_more: false,
+        stopped_reason: 'no_more_results',
+        query: finalQuery,
+      })
+    );
+  });
+
   it('reports the actual final query returned by FirewallaClient in the non-streaming tool response metadata', async () => {
     const finalQuery = `box.id:${BOX_ID} source.ip:192.168.1.50`;
     const handler = new GetFlowDataHandler();
@@ -431,9 +604,14 @@ describe('ExportFlowDataHandler', () => {
     expect(payload.data.blocked_count).toBe(1);
     expect(payload.data.unique_destinations).toBe(2);
     expect(payload.data.observed_time_range).toEqual({
+      oldest: '2024-03-09T16:00:00.000Z',
+      newest: '2024-03-09T16:02:00.000Z',
       start: '2024-03-09T16:00:00.000Z',
       end: '2024-03-09T16:02:00.000Z',
     });
+    expect(payload.data.total_records_fetched).toBe(3);
+    expect(payload.data.page_count).toBe(2);
+    expect(payload.data.query).toBe('box.id:box-gid-123 category:social');
     expect(payload.data.artifacts.raw_json_path).toMatch(
       /weekly-social-audit.*\.json$/
     );
@@ -490,6 +668,47 @@ describe('ExportFlowDataHandler', () => {
     expect(payload.data.stopped_reason).toBe('repeated_cursor');
     expect(payload.data.repeated_cursor).toBe('same-cursor');
     expect(payload.data.has_more).toBe(false);
+  });
+
+  it('reports max_rows when an export slices a larger fetched page', async () => {
+    const handler = new ExportFlowDataHandler();
+    const firewalla = {
+      getFlowData: jest.fn().mockResolvedValue({
+        count: 2,
+        results: [
+          {
+            ts: 1710000000,
+            download: 1,
+            upload: 2,
+            destination: { ip: '1.1.1.1', name: 'one.example' },
+          },
+          {
+            ts: 1710000060,
+            download: 3,
+            upload: 4,
+            destination: { ip: '2.2.2.2', name: 'two.example' },
+          },
+        ],
+        has_more: false,
+        final_query: 'box.id:box-gid-123',
+      }),
+    } as any;
+
+    const response = await handler.execute(
+      {
+        page_size: 2,
+        max_pages: 3,
+        max_rows: 1,
+        output_dir: outputDir,
+      },
+      firewalla
+    );
+    const payload = JSON.parse(response.content[0].text);
+
+    expect(payload.data.row_count).toBe(1);
+    expect(payload.data.total_records_fetched).toBe(2);
+    expect(payload.data.stopped_reason).toBe('max_rows');
+    expect(payload.data.has_more).toBe(true);
   });
 
   it('neutralizes spreadsheet formula cells and keeps absolute output_dir under the safe export base', async () => {

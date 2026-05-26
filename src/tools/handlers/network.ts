@@ -36,6 +36,65 @@ import {
   type StreamingOperation,
 } from '../../utils/streaming-manager.js';
 
+interface FlowObservedTimeRange {
+  oldest: string;
+  newest: string;
+  start: string;
+  end: string;
+}
+
+function getObservedTimeRange(flows: unknown): FlowObservedTimeRange | null {
+  if (!Array.isArray(flows) || flows.length === 0) {
+    return null;
+  }
+
+  const timestamps = flows
+    .map(flow => optionalUnixTimestamp(SafeAccess.getNestedValue(flow, 'ts')))
+    .filter((timestamp): timestamp is number => timestamp !== undefined);
+
+  if (timestamps.length === 0) {
+    return null;
+  }
+
+  const oldestTs = Math.min(...timestamps);
+  const newestTs = Math.max(...timestamps);
+  const oldest = safeUnixToISOString(oldestTs, '');
+  const newest = safeUnixToISOString(newestTs, '');
+
+  if (!oldest || !newest) {
+    return null;
+  }
+
+  return {
+    oldest,
+    newest,
+    start: oldest,
+    end: newest,
+  };
+}
+
+function getFlowObservationMetadata(
+  response: any,
+  query: unknown,
+  hasMore: boolean
+): Record<string, unknown> {
+  const pagesFetched = response.pages_fetched ?? 1;
+  const stoppedReason =
+    response.stopped_reason ?? (hasMore ? 'page_limit' : 'no_more_results');
+
+  return {
+    observed_time_range: getObservedTimeRange(response.results),
+    total_records_fetched: Array.isArray(response.results)
+      ? response.results.length
+      : 0,
+    pages_fetched: pagesFetched,
+    page_count: pagesFetched,
+    has_more: hasMore,
+    stopped_reason: stoppedReason,
+    query,
+  };
+}
+
 export class GetFlowDataHandler extends BaseToolHandler {
   name = 'get_flow_data';
   description =
@@ -268,6 +327,11 @@ export class GetFlowDataHandler extends BaseToolHandler {
           const actualFinalQuery = response.final_query || finalQuery;
           const hasMore = response.has_more ?? !!response.next_cursor;
           const nextCursor = hasMore ? response.next_cursor : null;
+          const observationMetadata = getFlowObservationMetadata(
+            response,
+            actualFinalQuery,
+            hasMore
+          );
 
           return {
             data: processedFlows,
@@ -282,10 +346,11 @@ export class GetFlowDataHandler extends BaseToolHandler {
                 start_time: startTimeArg,
                 end_time: endTime,
               },
+              ...observationMetadata,
               pages_fetched: response.pages_fetched ?? 1,
               has_more: hasMore,
               next_cursor: nextCursor,
-              stopped_reason: response.stopped_reason ?? null,
+              stopped_reason: observationMetadata.stopped_reason,
               repeated_cursor: response.repeated_cursor,
               requested_limit: response.requested_limit,
               applied_limit: response.applied_limit,
@@ -376,6 +441,11 @@ export class GetFlowDataHandler extends BaseToolHandler {
       const actualFinalQuery = response.final_query || finalQuery;
       const hasMore = response.has_more ?? !!response.next_cursor;
       const nextCursor = hasMore ? response.next_cursor : null;
+      const observationMetadata = getFlowObservationMetadata(
+        response,
+        actualFinalQuery,
+        hasMore
+      );
 
       // Create metadata for standardized response
       const metadata: PaginationMetadata = {
@@ -404,9 +474,10 @@ export class GetFlowDataHandler extends BaseToolHandler {
       );
       standardResponse.pagination.next_cursor = nextCursor;
       standardResponse.pagination.has_more = hasMore;
+      Object.assign(standardResponse.pagination, observationMetadata);
       standardResponse.pagination.pages_fetched = response.pages_fetched ?? 1;
       standardResponse.pagination.stopped_reason =
-        response.stopped_reason ?? null;
+        observationMetadata.stopped_reason;
       standardResponse.pagination.repeated_cursor = response.repeated_cursor;
       standardResponse.pagination.requested_limit = response.requested_limit;
       standardResponse.pagination.applied_limit = response.applied_limit;
@@ -685,6 +756,7 @@ export class ExportFlowDataHandler extends BaseToolHandler {
       let repeatedCursor: string | undefined;
       let hasMore = false;
       let finalQuery: string | undefined = query;
+      let totalRecordsFetched = 0;
 
       for (let page = 0; page < maxPages && flows.length < maxRows; page += 1) {
         const requestedCursor = cursor;
@@ -703,9 +775,18 @@ export class ExportFlowDataHandler extends BaseToolHandler {
           ? response.results
           : [];
         const remainingRows = maxRows - flows.length;
+        totalRecordsFetched += pageResults.length;
+        const truncatedByMaxRows = pageResults.length > remainingRows;
         flows.push(...pageResults.slice(0, remainingRows));
         pagesFetched += 1;
         finalQuery = response.final_query || finalQuery;
+
+        if (truncatedByMaxRows) {
+          stoppedReason = 'max_rows';
+          hasMore = true;
+          cursor = undefined;
+          break;
+        }
 
         const responseRepeatedCursor =
           response.stopped_reason === 'repeated_cursor';
@@ -733,7 +814,7 @@ export class ExportFlowDataHandler extends BaseToolHandler {
           break;
         }
 
-        if (flows.length >= maxRows) {
+        if (flows.length >= maxRows && hasMore) {
           stoppedReason = 'max_rows';
           break;
         }
@@ -761,6 +842,15 @@ export class ExportFlowDataHandler extends BaseToolHandler {
           .filter(Boolean)
       ).size;
 
+      const observedStart =
+        timestamps.length > 0
+          ? new Date(timestamps[0] * 1000).toISOString()
+          : null;
+      const observedEnd =
+        timestamps.length > 0
+          ? new Date(timestamps[timestamps.length - 1] * 1000).toISOString()
+          : null;
+
       const metadata = {
         exported_at: new Date().toISOString(),
         query_parameters: {
@@ -773,7 +863,9 @@ export class ExportFlowDataHandler extends BaseToolHandler {
           initial_cursor: args?.cursor,
         },
         row_count: flows.length,
+        total_records_fetched: totalRecordsFetched,
         pages_fetched: pagesFetched,
+        page_count: pagesFetched,
         stopped_reason: stoppedReason,
         has_more:
           hasMore &&
@@ -786,15 +878,12 @@ export class ExportFlowDataHandler extends BaseToolHandler {
             : undefined,
         repeated_cursor: repeatedCursor,
         observed_time_range: {
-          start:
-            timestamps.length > 0
-              ? new Date(timestamps[0] * 1000).toISOString()
-              : null,
-          end:
-            timestamps.length > 0
-              ? new Date(timestamps[timestamps.length - 1] * 1000).toISOString()
-              : null,
+          oldest: observedStart,
+          newest: observedEnd,
+          start: observedStart,
+          end: observedEnd,
         },
+        query: finalQuery,
         total_bytes: totalBytes,
         unique_destinations: uniqueDestinations,
         blocked_count: blockedCount,

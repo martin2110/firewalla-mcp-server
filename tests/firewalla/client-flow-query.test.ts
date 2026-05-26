@@ -127,6 +127,37 @@ describe('FirewallaClient getFlowData flow query construction', () => {
     );
     expect(response.final_query).toBe(userQuery);
   });
+
+  it('stops pagination safely when Firewalla repeats the requested cursor', async () => {
+    const repeatedCursor = 'b2Zmc2V0IDUwMA==';
+    const client = createClient();
+    jest.spyOn(client as any, 'request').mockResolvedValue({
+      count: 1,
+      results: [
+        {
+          ts: 1710000000,
+          srcIP: '192.168.1.50',
+          dstIP: '192.168.1.1',
+          device: { id: 'device-1', ip: '192.168.1.50', name: 'Laptop' },
+        },
+      ],
+      next_cursor: repeatedCursor,
+    });
+
+    const response = await client.getFlowData(
+      undefined,
+      undefined,
+      'ts:desc',
+      500,
+      repeatedCursor
+    );
+
+    expect(response.next_cursor).toBeUndefined();
+    expect(response.has_more).toBe(false);
+    expect(response.pages_fetched).toBe(1);
+    expect(response.stopped_reason).toBe('repeated_cursor');
+    expect(response.repeated_cursor).toBe(repeatedCursor);
+  });
 });
 
 describe('GetFlowDataHandler final query metadata', () => {
@@ -180,5 +211,101 @@ describe('GetFlowDataHandler final query metadata', () => {
     expect(payload.metadata.query_parameters.query).not.toContain(
       'test-token-redacted'
     );
+  });
+
+  it('reports safe pagination metadata in non-streaming flow responses', async () => {
+    const handler = new GetFlowDataHandler();
+    const firewalla = {
+      getFlowData: jest.fn().mockResolvedValue({
+        count: 0,
+        results: [],
+        next_cursor: undefined,
+        has_more: false,
+        pages_fetched: 1,
+        stopped_reason: 'repeated_cursor',
+        repeated_cursor: 'b2Zmc2V0IDUwMA==',
+      }),
+    } as any;
+
+    const response = await handler.execute(
+      { limit: 50, cursor: 'b2Zmc2V0IDUwMA==' },
+      firewalla
+    );
+    const payload = JSON.parse(response.content[0].text);
+
+    expect(payload.data.pagination.pages_fetched).toBe(1);
+    expect(payload.data.pagination.has_more).toBe(false);
+    expect(payload.data.pagination.next_cursor).toBeNull();
+    expect(payload.data.pagination.stopped_reason).toBe('repeated_cursor');
+    expect(payload.data.pagination.repeated_cursor).toBe('b2Zmc2V0IDUwMA==');
+  });
+
+  it('ends a streaming session when a page repeats the previous cursor and uses safe page sizes', async () => {
+    const repeatedCursor = 'b2Zmc2V0IDUwMA==';
+    const handler = new GetFlowDataHandler();
+    const firewalla = {
+      getFlowData: jest.fn().mockImplementation(
+        async (
+          _query,
+          _groupBy,
+          _sortBy,
+          _limit,
+          cursor: string | undefined
+        ) => ({
+          count: 1,
+          results: [
+            {
+              ts: 1710000000,
+              protocol: 'tcp',
+              download: 1,
+              upload: 1,
+              count: 1,
+              device: { id: 'device-1', ip: '192.168.1.50', name: 'Laptop' },
+            },
+          ],
+          next_cursor: repeatedCursor,
+          has_more: cursor !== repeatedCursor,
+          pages_fetched: cursor === repeatedCursor ? 2 : 1,
+          stopped_reason: cursor === repeatedCursor ? 'repeated_cursor' : undefined,
+          repeated_cursor: cursor === repeatedCursor ? repeatedCursor : undefined,
+        })
+      ),
+    } as any;
+
+    const firstResponse = await handler.execute({ limit: 500 }, firewalla);
+    const firstPayload = JSON.parse(firstResponse.content[0].text);
+
+    expect(firstPayload.streaming).toBe(true);
+    expect(firstPayload.isFinalChunk).toBe(false);
+    expect(firstPayload.nextContinuationToken).toBe(repeatedCursor);
+
+    const secondResponse = await handler.execute(
+      { limit: 500, streaming_session_id: firstPayload.sessionId },
+      firewalla
+    );
+    const secondPayload = JSON.parse(secondResponse.content[0].text);
+
+    expect(firewalla.getFlowData).toHaveBeenNthCalledWith(
+      1,
+      undefined,
+      undefined,
+      undefined,
+      50,
+      undefined
+    );
+    expect(firewalla.getFlowData).toHaveBeenNthCalledWith(
+      2,
+      undefined,
+      undefined,
+      undefined,
+      50,
+      repeatedCursor
+    );
+    expect(secondPayload.isFinalChunk).toBe(true);
+    expect(secondPayload.nextContinuationToken).toBeNull();
+    expect(secondPayload.metadata.pages_fetched).toBe(2);
+    expect(secondPayload.metadata.has_more).toBe(false);
+    expect(secondPayload.metadata.next_cursor).toBeNull();
+    expect(secondPayload.metadata.stopped_reason).toBe('repeated_cursor');
   });
 });

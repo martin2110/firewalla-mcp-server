@@ -262,11 +262,22 @@ export class GetFlowDataHandler extends BaseToolHandler {
             })
           );
 
+          const actualFinalQuery = response.final_query || finalQuery;
+
           return {
             data: processedFlows,
             hasMore: !!response.next_cursor,
             nextCursor: response.next_cursor,
             total: (response as any).total_count,
+            metadata: {
+              query_parameters: {
+                query: actualFinalQuery,
+                groupBy,
+                sortBy,
+                start_time: startTimeArg,
+                end_time: endTime,
+              },
+            },
           };
         };
 
@@ -350,6 +361,8 @@ export class GetFlowDataHandler extends BaseToolHandler {
         'destination_ip',
       ]);
 
+      const actualFinalQuery = response.final_query || finalQuery;
+
       // Create metadata for standardized response
       const metadata: PaginationMetadata = {
         cursor: response.next_cursor,
@@ -359,7 +372,7 @@ export class GetFlowDataHandler extends BaseToolHandler {
         cached: false,
         source: 'firewalla_api',
         queryParams: {
-          query: finalQuery,
+          query: actualFinalQuery,
           groupBy,
           sortBy,
           limit,

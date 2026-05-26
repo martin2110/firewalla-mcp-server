@@ -763,7 +763,12 @@ export class FirewallaClient {
     sortBy = 'ts:desc',
     limit = 200,
     cursor?: string
-  ): Promise<{ count: number; results: Flow[]; next_cursor?: string }> {
+  ): Promise<{
+    count: number;
+    results: Flow[];
+    next_cursor?: string;
+    final_query?: string;
+  }> {
     const params: Record<string, unknown> = {
       sortBy,
       limit, // Remove artificial limit - let pagination handle large datasets
@@ -780,8 +785,17 @@ export class FirewallaClient {
       params.cursor = cursor;
     }
 
-    // Apply box filter through the query parameter
-    params.query = this.addBoxFilter(params.query as string | undefined);
+    // Apply Firewalla-compatible flow box scoping through the query parameter.
+    // /v2/flows uses implicit AND with the box.id qualifier and does not accept
+    // the gid:<id> / explicit AND syntax used by other endpoints.
+    const finalQuery = this.addFlowBoxFilter(
+      params.query as string | undefined
+    );
+    if (finalQuery) {
+      params.query = finalQuery;
+    } else {
+      delete params.query;
+    }
 
     const response = await this.request<{
       count: number;
@@ -875,6 +889,7 @@ export class FirewallaClient {
         this.enrichWithGeographicData(flow, ['destination.ip', 'source.ip'])
       ),
       next_cursor: response.next_cursor,
+      final_query: finalQuery,
     };
   }
 
@@ -4883,6 +4898,41 @@ export class FirewallaClient {
     }
 
     return `${query} AND ${boxFilter}`;
+  }
+
+  /**
+   * Helper method to add Firewalla-compatible box.id scoping to flow queries.
+   *
+   * Flow search syntax uses implicit AND via space-separated terms and expects
+   * box.id:<gid> before the user query. This is intentionally separate from
+   * addBoxFilter so other endpoints keep their existing query behavior.
+   *
+   * @param query - Existing flow query string (optional)
+   * @returns Final flow query with box.id scoping applied when configured
+   * @private
+   */
+  private addFlowBoxFilter(query?: string): string | undefined {
+    const trimmedQuery = query?.trim();
+
+    if (!this.config.boxId) {
+      return trimmedQuery || undefined;
+    }
+
+    const boxFilter = `box.id:${this.config.boxId}`;
+
+    if (!trimmedQuery) {
+      return boxFilter;
+    }
+
+    const escapedBoxFilter = boxFilter.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const exactBoxFilterPattern = new RegExp(
+      `(^|\\s|\\()${escapedBoxFilter}(?=$|\\s|\\))`
+    );
+    if (exactBoxFilterPattern.test(trimmedQuery)) {
+      return trimmedQuery;
+    }
+
+    return `${boxFilter} ${trimmedQuery}`;
   }
 
   /**

@@ -768,10 +768,18 @@ export class FirewallaClient {
     results: Flow[];
     next_cursor?: string;
     final_query?: string;
+    has_more: boolean;
+    pages_fetched: number;
+    stopped_reason?: 'repeated_cursor';
+    repeated_cursor?: string;
+    requested_limit: number;
+    applied_limit: number;
   }> {
+    const requestedLimit = limit;
+    const appliedLimit = Math.min(limit, 50);
     const params: Record<string, unknown> = {
       sortBy,
-      limit, // Remove artificial limit - let pagination handle large datasets
+      limit: appliedLimit,
     };
 
     // Simplified: only add query if provided
@@ -883,13 +891,25 @@ export class FirewallaClient {
       }
     );
 
+    const repeatedCursor =
+      typeof cursor === 'string' &&
+      cursor.length > 0 &&
+      response.next_cursor === cursor;
+    const safeNextCursor = repeatedCursor ? undefined : response.next_cursor;
+
     return {
       count: response.count || flows.length,
       results: flows.map(flow =>
         this.enrichWithGeographicData(flow, ['destination.ip', 'source.ip'])
       ),
-      next_cursor: response.next_cursor,
+      next_cursor: safeNextCursor,
       final_query: finalQuery,
+      has_more: !!safeNextCursor,
+      pages_fetched: 1,
+      stopped_reason: repeatedCursor ? 'repeated_cursor' : undefined,
+      repeated_cursor: repeatedCursor ? cursor : undefined,
+      requested_limit: requestedLimit,
+      applied_limit: appliedLimit,
     };
   }
 

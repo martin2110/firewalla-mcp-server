@@ -194,9 +194,9 @@ export class StreamingManager {
     try {
       // Prepare parameters for this chunk
       const chunkParams: PaginationParams = {
+        ...session.originalParams,
         limit: session.config.chunkSize,
         cursor: session.continuationToken,
-        ...session.originalParams,
       };
 
       // Execute the operation to get data

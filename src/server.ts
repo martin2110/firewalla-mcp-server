@@ -197,6 +197,68 @@ export class FirewallaMCPServer {
             },
           },
           {
+            name: 'export_flow_data',
+            description:
+              'Safely paginate Firewalla flow data to server-side raw JSON and CSV artifacts, returning a compact summary instead of all flows.',
+            inputSchema: {
+              type: 'object',
+              properties: {
+                query: {
+                  type: 'string',
+                  description:
+                    'Search query for flows. Uses the same syntax as get_flow_data.',
+                },
+                groupBy: {
+                  type: 'string',
+                  description: 'Optional flow grouping field(s).',
+                },
+                sortBy: {
+                  type: 'string',
+                  description: 'Sort flows (default: "ts:desc").',
+                },
+                page_size: {
+                  type: 'integer',
+                  description:
+                    'Flows to request per page (default: 50, maximum: 50).',
+                  minimum: 1,
+                  maximum: 50,
+                  default: 50,
+                },
+                max_pages: {
+                  type: 'integer',
+                  description:
+                    'Maximum pages to fetch before stopping safely (default: 10).',
+                  minimum: 1,
+                  maximum: 1000,
+                  default: 10,
+                },
+                max_rows: {
+                  type: 'integer',
+                  description:
+                    'Maximum flow rows to write across all pages (default: 50000).',
+                  minimum: 1,
+                  maximum: 1000000,
+                  default: 50000,
+                },
+                cursor: {
+                  type: 'string',
+                  description: 'Optional initial pagination cursor.',
+                },
+                output_dir: {
+                  type: 'string',
+                  description:
+                    'Optional sanitized subdirectory under ./firewalla-flow-exports for artifacts.',
+                },
+                export_prefix: {
+                  type: 'string',
+                  description:
+                    'Filename prefix for generated artifacts (sanitized).',
+                },
+              },
+              required: [],
+            },
+          },
+          {
             name: 'get_device_status',
             description:
               'Check online/offline status of devices on Firewalla network',

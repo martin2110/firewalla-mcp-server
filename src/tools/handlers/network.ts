@@ -2,6 +2,8 @@
  * Network monitoring and analysis tool handlers
  */
 
+import { mkdir, writeFile } from 'node:fs/promises';
+import { join, resolve, sep } from 'node:path';
 import { BaseToolHandler, type ToolArgs, type ToolResponse } from './base.js';
 import type { FirewallaClient } from '../../firewalla/client.js';
 import {
@@ -34,11 +36,71 @@ import {
   type StreamingOperation,
 } from '../../utils/streaming-manager.js';
 
+interface FlowObservedTimeRange {
+  oldest: string;
+  newest: string;
+  start: string;
+  end: string;
+}
+
+function getObservedTimeRange(flows: unknown): FlowObservedTimeRange | null {
+  if (!Array.isArray(flows) || flows.length === 0) {
+    return null;
+  }
+
+  const timestamps = flows
+    .map(flow => optionalUnixTimestamp(SafeAccess.getNestedValue(flow, 'ts')))
+    .filter((timestamp): timestamp is number => timestamp !== undefined);
+
+  if (timestamps.length === 0) {
+    return null;
+  }
+
+  const oldestTs = Math.min(...timestamps);
+  const newestTs = Math.max(...timestamps);
+  const oldest = safeUnixToISOString(oldestTs, '');
+  const newest = safeUnixToISOString(newestTs, '');
+
+  if (!oldest || !newest) {
+    return null;
+  }
+
+  return {
+    oldest,
+    newest,
+    start: oldest,
+    end: newest,
+  };
+}
+
+function getFlowObservationMetadata(
+  response: any,
+  query: unknown,
+  hasMore: boolean
+): Record<string, unknown> {
+  const pagesFetched = response.pages_fetched ?? 1;
+  const stoppedReason =
+    response.stopped_reason ?? (hasMore ? 'page_limit' : 'no_more_results');
+
+  return {
+    observed_time_range: getObservedTimeRange(response.results),
+    total_records_fetched: Array.isArray(response.results)
+      ? response.results.length
+      : 0,
+    pages_fetched: pagesFetched,
+    page_count: pagesFetched,
+    has_more: hasMore,
+    stopped_reason: stoppedReason,
+    query,
+  };
+}
+
 export class GetFlowDataHandler extends BaseToolHandler {
   name = 'get_flow_data';
   description =
     'Query network traffic flows with pagination. Data is cached for 15 seconds for performance. Use force_refresh=true to bypass cache for real-time data.';
   category = 'network' as const;
+  private readonly streamingManager = StreamingManager.forTool(this.name);
 
   constructor() {
     super({
@@ -208,7 +270,7 @@ export class GetFlowDataHandler extends BaseToolHandler {
 
       // Handle streaming mode if enabled
       if (enableStreaming) {
-        const streamingManager = StreamingManager.forTool(this.name);
+        const { streamingManager } = this;
 
         // Define the streaming operation
         const streamingOperation: StreamingOperation = async params => {
@@ -263,11 +325,18 @@ export class GetFlowDataHandler extends BaseToolHandler {
           );
 
           const actualFinalQuery = response.final_query || finalQuery;
+          const hasMore = response.has_more ?? !!response.next_cursor;
+          const nextCursor = hasMore ? response.next_cursor : null;
+          const observationMetadata = getFlowObservationMetadata(
+            response,
+            actualFinalQuery,
+            hasMore
+          );
 
           return {
             data: processedFlows,
-            hasMore: !!response.next_cursor,
-            nextCursor: response.next_cursor,
+            hasMore,
+            nextCursor,
             total: (response as any).total_count,
             metadata: {
               query_parameters: {
@@ -277,6 +346,14 @@ export class GetFlowDataHandler extends BaseToolHandler {
                 start_time: startTimeArg,
                 end_time: endTime,
               },
+              ...observationMetadata,
+              pages_fetched: response.pages_fetched ?? 1,
+              has_more: hasMore,
+              next_cursor: nextCursor,
+              stopped_reason: observationMetadata.stopped_reason,
+              repeated_cursor: response.repeated_cursor,
+              requested_limit: response.requested_limit,
+              applied_limit: response.applied_limit,
             },
           };
         };
@@ -362,11 +439,18 @@ export class GetFlowDataHandler extends BaseToolHandler {
       ]);
 
       const actualFinalQuery = response.final_query || finalQuery;
+      const hasMore = response.has_more ?? !!response.next_cursor;
+      const nextCursor = hasMore ? response.next_cursor : null;
+      const observationMetadata = getFlowObservationMetadata(
+        response,
+        actualFinalQuery,
+        hasMore
+      );
 
       // Create metadata for standardized response
       const metadata: PaginationMetadata = {
-        cursor: response.next_cursor,
-        hasMore: !!response.next_cursor,
+        cursor: nextCursor || undefined,
+        hasMore,
         limit,
         executionTime,
         cached: false,
@@ -384,10 +468,19 @@ export class GetFlowDataHandler extends BaseToolHandler {
       };
 
       // Create standardized response
-      const standardResponse = ResponseStandardizer.toPaginatedResponse(
+      const standardResponse: any = ResponseStandardizer.toPaginatedResponse(
         processedFlows,
         metadata
       );
+      standardResponse.pagination.next_cursor = nextCursor;
+      standardResponse.pagination.has_more = hasMore;
+      Object.assign(standardResponse.pagination, observationMetadata);
+      standardResponse.pagination.pages_fetched = response.pages_fetched ?? 1;
+      standardResponse.pagination.stopped_reason =
+        observationMetadata.stopped_reason;
+      standardResponse.pagination.repeated_cursor = response.repeated_cursor;
+      standardResponse.pagination.requested_limit = response.requested_limit;
+      standardResponse.pagination.applied_limit = response.applied_limit;
 
       return this.createUnifiedResponse(standardResponse, {
         executionTimeMs: executionTime,
@@ -406,6 +499,430 @@ export class GetFlowDataHandler extends BaseToolHandler {
         error instanceof Error ? error.message : 'Unknown error occurred';
       return this.createErrorResponse(
         `Failed to get flow data: ${errorMessage}`,
+        ErrorType.API_ERROR,
+        { originalError: errorMessage }
+      );
+    }
+  }
+}
+
+type FlowExportStoppedReason =
+  | 'no_more_results'
+  | 'max_pages'
+  | 'max_rows'
+  | 'repeated_cursor'
+  | 'api_repeated_cursor';
+
+interface ExportableFlowRow {
+  timestamp: string;
+  source_ip: string;
+  destination_ip: string;
+  destination_name: string;
+  protocol: string;
+  bytes: number;
+  download: number;
+  upload: number;
+  blocked: boolean;
+  device_id: string;
+  device_name: string;
+  device_ip: string;
+  category: string;
+  region: string;
+}
+
+function toNumber(value: unknown, fallback = 0): number {
+  const numberValue = Number(value);
+  return Number.isFinite(numberValue) ? numberValue : fallback;
+}
+
+function optionalUnixTimestamp(value: unknown): number | undefined {
+  const parsed = toNumber(value, Number.NaN);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return undefined;
+  }
+  return parsed > 1000000000000 ? Math.floor(parsed / 1000) : parsed;
+}
+
+function csvEscape(value: unknown): string {
+  if (value === null || value === undefined) {
+    return '';
+  }
+  const stringValue = String(value);
+  const safeValue = /^(\s*[=+\-@]|[\t\r\n])/.test(stringValue)
+    ? `'${stringValue}`
+    : stringValue;
+  if (!/[",\n\r]/.test(safeValue)) {
+    return safeValue;
+  }
+  return `"${safeValue.replace(/"/g, '""')}"`;
+}
+
+function safeFileComponent(value: unknown, fallback: string): string {
+  const sanitized = String(value || fallback)
+    .toLowerCase()
+    .replace(/[^a-z0-9._-]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 80);
+  return sanitized || fallback;
+}
+
+function normalizeFlowForExport(flow: any): ExportableFlowRow {
+  const download = toNumber(SafeAccess.getNestedValue(flow, 'download', 0));
+  const upload = toNumber(SafeAccess.getNestedValue(flow, 'upload', 0));
+  const bytes = toNumber(
+    SafeAccess.getNestedValue(flow, 'bytes', download + upload)
+  );
+
+  return {
+    timestamp: safeUnixToISOString(
+      optionalUnixTimestamp(SafeAccess.getNestedValue(flow, 'ts', undefined)) ??
+        0,
+      ''
+    ),
+    source_ip: String(
+      SafeAccess.getNestedValue(
+        flow,
+        'source.ip',
+        SafeAccess.getNestedValue(flow, 'device.ip', 'unknown')
+      )
+    ),
+    destination_ip: String(
+      SafeAccess.getNestedValue(flow, 'destination.ip', 'unknown')
+    ),
+    destination_name: String(
+      SafeAccess.getNestedValue(flow, 'destination.name', 'unknown')
+    ),
+    protocol: String(SafeAccess.getNestedValue(flow, 'protocol', 'unknown')),
+    bytes,
+    download,
+    upload,
+    blocked: Boolean(SafeAccess.getNestedValue(flow, 'block', false)),
+    device_id: String(SafeAccess.getNestedValue(flow, 'device.id', 'unknown')),
+    device_name: String(
+      SafeAccess.getNestedValue(flow, 'device.name', 'unknown')
+    ),
+    device_ip: String(SafeAccess.getNestedValue(flow, 'device.ip', 'unknown')),
+    category: String(SafeAccess.getNestedValue(flow, 'category', '')),
+    region: String(SafeAccess.getNestedValue(flow, 'region', '')),
+  };
+}
+
+function flowsToCsv(rows: ExportableFlowRow[]): string {
+  const headers: Array<keyof ExportableFlowRow> = [
+    'timestamp',
+    'source_ip',
+    'destination_ip',
+    'destination_name',
+    'protocol',
+    'bytes',
+    'download',
+    'upload',
+    'blocked',
+    'device_id',
+    'device_name',
+    'device_ip',
+    'category',
+    'region',
+  ];
+  return [
+    headers.join(','),
+    ...rows.map(row => headers.map(header => csvEscape(row[header])).join(',')),
+  ].join('\n');
+}
+
+export class ExportFlowDataHandler extends BaseToolHandler {
+  name = 'export_flow_data';
+  description =
+    'Safely paginate Firewalla flow data to server-side raw JSON and CSV artifacts, returning only a compact export summary.';
+  category = 'network' as const;
+
+  constructor() {
+    super({
+      enableGeoEnrichment: false,
+      enableFieldNormalization: true,
+      additionalMeta: {
+        data_source: 'flows',
+        entity_type: 'flow_export',
+        writes_artifacts: true,
+        standardization_version: '2.0.0',
+      },
+    });
+  }
+
+  async execute(
+    rawArgs: unknown,
+    firewalla: FirewallaClient
+  ): Promise<ToolResponse> {
+    const sanitizationResult = this.sanitizeParameters(rawArgs);
+
+    if ('errorResponse' in sanitizationResult) {
+      return sanitizationResult.errorResponse;
+    }
+
+    const args = sanitizationResult.sanitizedArgs;
+    const startTime = Date.now();
+
+    try {
+      const pageSizeValidation = ParameterValidator.validateNumber(
+        args?.page_size ?? args?.limit,
+        'page_size',
+        {
+          required: false,
+          defaultValue: 50,
+          min: 1,
+          max: 50,
+          integer: true,
+        }
+      );
+      const maxPagesValidation = ParameterValidator.validateNumber(
+        args?.max_pages,
+        'max_pages',
+        {
+          required: false,
+          defaultValue: 10,
+          min: 1,
+          max: 1000,
+          integer: true,
+        }
+      );
+      const maxRowsValidation = ParameterValidator.validateNumber(
+        args?.max_rows,
+        'max_rows',
+        {
+          required: false,
+          defaultValue: 50000,
+          min: 1,
+          max: 1000000,
+          integer: true,
+        }
+      );
+
+      const validationResult = ParameterValidator.combineValidationResults([
+        pageSizeValidation,
+        maxPagesValidation,
+        maxRowsValidation,
+      ]);
+
+      if (!validationResult.isValid) {
+        return this.createErrorResponse(
+          'Parameter validation failed',
+          ErrorType.VALIDATION_ERROR,
+          undefined,
+          validationResult.errors
+        );
+      }
+
+      const query = args?.query;
+      const groupBy = args?.groupBy;
+      const sortBy = args?.sortBy;
+      const pageSize = pageSizeValidation.sanitizedValue as number;
+      const maxPages = maxPagesValidation.sanitizedValue as number;
+      const maxRows = maxRowsValidation.sanitizedValue as number;
+      const exportBaseDir = resolve(process.cwd(), 'firewalla-flow-exports');
+      const outputSubdir = args?.output_dir
+        ? safeFileComponent(args.output_dir, 'export')
+        : '';
+      const outputDir = resolve(
+        outputSubdir ? join(exportBaseDir, outputSubdir) : exportBaseDir
+      );
+      if (
+        outputDir !== exportBaseDir &&
+        !outputDir.startsWith(`${exportBaseDir}${sep}`)
+      ) {
+        return this.createErrorResponse(
+          'Invalid output_dir',
+          ErrorType.VALIDATION_ERROR,
+          {
+            details:
+              'output_dir must resolve under the firewalla-flow-exports directory',
+          },
+          ['Choose a simple subdirectory name, not a parent directory path']
+        );
+      }
+      const exportPrefix = safeFileComponent(
+        args?.export_prefix,
+        'flow-export'
+      );
+      const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+      const rawJsonPath = join(outputDir, `${exportPrefix}-${stamp}.json`);
+      const csvPath = join(outputDir, `${exportPrefix}-${stamp}.csv`);
+
+      await mkdir(outputDir, { recursive: true });
+
+      const flows: any[] = [];
+      let cursor = args?.cursor;
+      let pagesFetched = 0;
+      let stoppedReason: FlowExportStoppedReason = 'no_more_results';
+      let repeatedCursor: string | undefined;
+      let hasMore = false;
+      let finalQuery: string | undefined = query;
+      let totalRecordsFetched = 0;
+
+      for (let page = 0; page < maxPages && flows.length < maxRows; page += 1) {
+        const requestedCursor = cursor;
+        const response = await withToolTimeout(
+          async () =>
+            firewalla.getFlowData(
+              query,
+              groupBy,
+              sortBy,
+              pageSize,
+              requestedCursor
+            ),
+          this.name
+        );
+        const pageResults = Array.isArray(response.results)
+          ? response.results
+          : [];
+        const remainingRows = maxRows - flows.length;
+        totalRecordsFetched += pageResults.length;
+        const truncatedByMaxRows = pageResults.length > remainingRows;
+        flows.push(...pageResults.slice(0, remainingRows));
+        pagesFetched += 1;
+        finalQuery = response.final_query || finalQuery;
+
+        if (truncatedByMaxRows) {
+          stoppedReason = 'max_rows';
+          hasMore = true;
+          cursor = undefined;
+          break;
+        }
+
+        const responseRepeatedCursor =
+          response.stopped_reason === 'repeated_cursor';
+        const nextCursor = response.next_cursor;
+        const repeatsRequestedCursor =
+          typeof requestedCursor === 'string' &&
+          requestedCursor.length > 0 &&
+          nextCursor === requestedCursor;
+
+        if (responseRepeatedCursor || repeatsRequestedCursor) {
+          stoppedReason = responseRepeatedCursor
+            ? 'api_repeated_cursor'
+            : 'repeated_cursor';
+          repeatedCursor = response.repeated_cursor || requestedCursor;
+          hasMore = false;
+          cursor = undefined;
+          break;
+        }
+
+        hasMore = response.has_more ?? !!nextCursor;
+        cursor = hasMore ? nextCursor : undefined;
+
+        if (!hasMore || !cursor) {
+          stoppedReason = 'no_more_results';
+          break;
+        }
+
+        if (flows.length >= maxRows && hasMore) {
+          stoppedReason = 'max_rows';
+          break;
+        }
+
+        if (page + 1 >= maxPages) {
+          stoppedReason = 'max_pages';
+          break;
+        }
+      }
+
+      const rows = flows.map(normalizeFlowForExport);
+      const timestamps = flows
+        .map(flow =>
+          optionalUnixTimestamp(
+            SafeAccess.getNestedValue(flow, 'ts', undefined)
+          )
+        )
+        .filter((ts): ts is number => typeof ts === 'number')
+        .sort((a, b) => a - b);
+      const totalBytes = rows.reduce((sum, row) => sum + row.bytes, 0);
+      const blockedCount = rows.filter(row => row.blocked).length;
+      const uniqueDestinations = new Set(
+        rows
+          .map(row => row.destination_ip || row.destination_name)
+          .filter(Boolean)
+      ).size;
+
+      const observedStart =
+        timestamps.length > 0
+          ? new Date(timestamps[0] * 1000).toISOString()
+          : null;
+      const observedEnd =
+        timestamps.length > 0
+          ? new Date(timestamps[timestamps.length - 1] * 1000).toISOString()
+          : null;
+
+      const metadata = {
+        exported_at: new Date().toISOString(),
+        query_parameters: {
+          query: finalQuery,
+          groupBy,
+          sortBy,
+          page_size: pageSize,
+          max_pages: maxPages,
+          max_rows: maxRows,
+          initial_cursor: args?.cursor,
+        },
+        row_count: flows.length,
+        total_records_fetched: totalRecordsFetched,
+        pages_fetched: pagesFetched,
+        page_count: pagesFetched,
+        stopped_reason: stoppedReason,
+        has_more:
+          hasMore &&
+          (stoppedReason === 'max_pages' || stoppedReason === 'max_rows'),
+        next_cursor: stoppedReason === 'max_pages' ? cursor : null,
+        continuation_supported: stoppedReason === 'max_pages',
+        truncation_note:
+          stoppedReason === 'max_rows'
+            ? 'Export stopped at max_rows; continuation is not exposed because the last API page may have been partially written.'
+            : undefined,
+        repeated_cursor: repeatedCursor,
+        observed_time_range: {
+          oldest: observedStart,
+          newest: observedEnd,
+          start: observedStart,
+          end: observedEnd,
+        },
+        query: finalQuery,
+        total_bytes: totalBytes,
+        unique_destinations: uniqueDestinations,
+        blocked_count: blockedCount,
+      };
+
+      await writeFile(
+        rawJsonPath,
+        JSON.stringify(
+          {
+            metadata,
+            flows,
+          },
+          null,
+          2
+        ),
+        'utf8'
+      );
+      await writeFile(csvPath, `${flowsToCsv(rows)}\n`, 'utf8');
+
+      const summary = {
+        ...metadata,
+        artifacts: {
+          raw_json_path: rawJsonPath,
+          csv_path: csvPath,
+        },
+      };
+
+      return this.createUnifiedResponse(summary, {
+        executionTimeMs: Date.now() - startTime,
+      });
+    } catch (error: unknown) {
+      if (error instanceof TimeoutError) {
+        return createTimeoutErrorResponse(this.name, error.duration, 10000);
+      }
+
+      const errorMessage =
+        error instanceof Error ? error.message : 'Unknown error occurred';
+      return this.createErrorResponse(
+        `Failed to export flow data: ${errorMessage}`,
         ErrorType.API_ERROR,
         { originalError: errorMessage }
       );
